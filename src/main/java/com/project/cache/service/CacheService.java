@@ -7,8 +7,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.http.server.DelegatingServerHttpResponse;
 import org.springframework.stereotype.Service;
 
+import javax.persistence.EntityNotFoundException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -53,33 +55,61 @@ public class CacheService {
             lock.unlock();
         }
     }
-
-    /** remove from cache and DB */
+    /**
+     * Remove from cache and Postgres (delete-through).
+     * - If the id is NOT in cache: throw 404 (ResourceNotFoundException).
+     * - If the id is in cache: remove from cache, then attempt DB delete.
+     *   If the row isn't in DB already, treat as no-op (idempotent delete).
+     */
     public void remove(String id) {
-        if (id == null || id.trim().isEmpty())
+        if (id == null || id.trim().isEmpty()) {
             throw new IllegalArgumentException("id must not be null/blank");
+        }
 
+        boolean removedFromCache = false;
         lock.lock();
         try {
-            if (!lru.containsKey(id)) {
-                // If not in cache, throw 404
-                throw new ResourceNotFoundException("Entity with id=" + id + " not found in cache");
-            }
-
-            lru.remove(id);
-            log.info("Removed from cache: {}", id);
+            // Try remove from cache first
+            EntityModel removed = lru.remove(id);
+            removedFromCache = (removed != null);
         } finally {
             lock.unlock();
         }
-        try {
-            database.delete(id);
-        } catch (EmptyResultDataAccessException e){
-            log.info("{} Not found in Postgres" , id);
+
+        if (removedFromCache) {
+            log.info("Removed from cache: {}", id);
+
+            // Delete in DB (idempotent - ignore if not present)
+            try {
+                database.delete(id);
+                log.info("Removed from Postgres: {}", id);
+            } catch (EmptyResultDataAccessException ex) {
+                log.warn("Entity {} not found in Postgres during delete (no-op)", id);
+            }
+            return; // success
         }
 
-        log.info("Removed from Postgres: {}", id);
-    }
+        // Not in cache → check DB
+        log.info("Entity {} not found in cache; checking Postgres...", id);
 
+        // If present in DB, delete it and return success
+        if (database.findById(id).isPresent()) {
+            try {
+                database.delete(id);
+                log.info("Entity {} was not in cache but was deleted from Postgres", id);
+                return; // success
+            } catch (EmptyResultDataAccessException ex) {
+                // Very unlikely (race), treat as success
+                log.warn("Entity {} vanished from Postgres during delete (no-op)", id);
+                return;
+            }
+        }
+
+        // Not in cache AND not in DB -> 404
+        throw new ResourceNotFoundException(
+                "Entity with id=" + id + " not found in cache or Postgres"
+        );
+    }
     /** remove all from cache and DB */
     public void removeAll() {
         lock.lock();
